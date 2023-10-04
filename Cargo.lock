@@ -9528,6 +9528,7 @@ dependencies = [
  "axelar-wasm-std",
  "cosmwasm-schema",
  "cosmwasm-std",
+ "cw-storage-plus 1.1.0",
  "serde",
 ]
 
