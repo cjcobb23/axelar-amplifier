@@ -41,6 +41,12 @@ impl From<Uint64> for cosmwasm_std::Uint64 {
     }
 }
 
+impl From<Uint64> for u64 {
+    fn from(value: Uint64) -> Self {
+        value.0.into()
+    }
+}
+
 impl fmt::Display for Uint64 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
