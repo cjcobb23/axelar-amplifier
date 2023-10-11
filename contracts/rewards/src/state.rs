@@ -35,6 +35,7 @@ impl EpochTally {
 #[cw_serde]
 pub struct Event {
     event_id: String,
+    contract: Addr,
     epoch_num: u64,
 }
 
@@ -44,18 +45,19 @@ pub struct Epoch {
     block_height_started: u64,
 }
 
-impl Epoch {
-    pub fn new(epoch_num: u64, block_height_started: u64) -> Self {
-        Epoch {
-            epoch_num,
-            block_height_started,
-        }
-    }
-}
-
 #[cw_serde]
 pub struct RewardsPool {
+    contract: Addr,
     balance: Uint256,
+}
+
+impl RewardsPool {
+    pub fn new(contract: Addr) -> Self {
+        RewardsPool {
+            contract,
+            balance: Uint256::zero(),
+        }
+    }
 }
 
 pub trait Store {
@@ -71,28 +73,17 @@ pub trait Store {
         epoch_num: u64,
     ) -> Result<Option<EpochTally>, ContractError>;
 
-    fn load_rewards_pool(&self, contract: Addr) -> Result<RewardsPool, ContractError>;
+    fn load_rewards_pool(&self, contract: Addr) -> Result<Option<RewardsPool>, ContractError>;
 
-    fn save_event(
-        &mut self,
-        event_id: String,
-        contract: Addr,
-        event: Event,
-    ) -> Result<(), ContractError>;
+    fn save_config(&mut self, config: &Config) -> Result<(), ContractError>;
 
-    fn save_epoch_tally(
-        &mut self,
-        contract: Addr,
-        epoch_num: u64,
-        tally: EpochTally,
-    ) -> Result<(), ContractError>;
+    fn save_current_epoch(&mut self, epoch: &Epoch) -> Result<(), ContractError>;
 
-    fn save_current_epoch(&mut self, epoch: Epoch) -> Result<(), ContractError>;
+    fn save_event(&mut self, event: &Event) -> Result<(), ContractError>;
 
-    fn save_config(&mut self, config: Config) -> Result<(), ContractError>;
+    fn save_epoch_tally(&mut self, tally: &EpochTally) -> Result<(), ContractError>;
 
-    fn save_rewards_pool(&mut self, contract: Addr, pool: RewardsPool)
-        -> Result<(), ContractError>;
+    fn save_rewards_pool(&mut self, pool: &RewardsPool) -> Result<(), ContractError>;
 }
 
 pub const CONFIG: Item<Config> = Item::new("config");
@@ -116,6 +107,10 @@ impl Store for RewardsStore<'_> {
             .expect("config should be set during contract instantiation")
     }
 
+    fn load_current_epoch(&self) -> Result<Epoch, ContractError> {
+        Ok(CURRENT_EPOCH.load(self.storage)?)
+    }
+
     fn load_event(&self, event_id: String, contract: Addr) -> Result<Option<Event>, ContractError> {
         Ok(EVENTS.may_load(self.storage, (event_id, contract))?)
     }
@@ -128,46 +123,36 @@ impl Store for RewardsStore<'_> {
         Ok(TALLIES.may_load(self.storage, (contract, epoch_num))?)
     }
 
-    fn load_current_epoch(&self) -> Result<Epoch, ContractError> {
-        Ok(CURRENT_EPOCH.load(self.storage)?)
+    fn load_rewards_pool(&self, contract: Addr) -> Result<Option<RewardsPool>, ContractError> {
+        Ok(POOLS.may_load(self.storage, contract)?)
     }
 
-    fn load_rewards_pool(&self, contract: Addr) -> Result<RewardsPool, ContractError> {
-        Ok(POOLS.load(self.storage, contract)?)
+    fn save_config(&mut self, config: &Config) -> Result<(), ContractError> {
+        Ok(CONFIG.save(self.storage, config)?)
     }
 
-    fn save_config(&mut self, config: Config) -> Result<(), ContractError> {
-        Ok(CONFIG.save(self.storage, &config)?)
+    fn save_current_epoch(&mut self, epoch: &Epoch) -> Result<(), ContractError> {
+        Ok(CURRENT_EPOCH.save(self.storage, epoch)?)
     }
 
-    fn save_event(
-        &mut self,
-        event_id: String,
-        contract: Addr,
-        event: Event,
-    ) -> Result<(), ContractError> {
-        Ok(EVENTS.save(self.storage, (event_id, contract), &event)?)
+    fn save_event(&mut self, event: &Event) -> Result<(), ContractError> {
+        Ok(EVENTS.save(
+            self.storage,
+            (event.event_id.clone(), event.contract.clone()),
+            event,
+        )?)
     }
 
-    fn save_epoch_tally(
-        &mut self,
-        contract: Addr,
-        epoch_num: u64,
-        tally: EpochTally,
-    ) -> Result<(), ContractError> {
-        Ok(TALLIES.save(self.storage, (contract, epoch_num), &tally)?)
+    fn save_epoch_tally(&mut self, tally: &EpochTally) -> Result<(), ContractError> {
+        Ok(TALLIES.save(
+            self.storage,
+            (tally.contract.clone(), tally.epoch_num),
+            tally,
+        )?)
     }
 
-    fn save_current_epoch(&mut self, epoch: Epoch) -> Result<(), ContractError> {
-        Ok(CURRENT_EPOCH.save(self.storage, &epoch)?)
-    }
-
-    fn save_rewards_pool(
-        &mut self,
-        contract: Addr,
-        pool: RewardsPool,
-    ) -> Result<(), ContractError> {
-        Ok(POOLS.save(self.storage, contract, &pool)?)
+    fn save_rewards_pool(&mut self, pool: &RewardsPool) -> Result<(), ContractError> {
+        Ok(POOLS.save(self.storage, pool.contract.clone(), pool)?)
     }
 }
 
@@ -177,7 +162,7 @@ mod test {
 
     use crate::{msg::RewardsParams, state::Config};
 
-    use super::{Epoch, EpochTally, Event, RewardsStore, Store};
+    use super::{Epoch, EpochTally, Event, RewardsPool, RewardsStore, Store};
 
     #[test]
     fn save_and_load_config() {
@@ -193,7 +178,7 @@ mod test {
             },
         };
         // save an initial config, then load it
-        assert!(store.save_config(config.clone()).is_ok());
+        assert!(store.save_config(&config).is_ok());
         let loaded = store.load_config();
         assert_eq!(loaded, config);
 
@@ -204,7 +189,7 @@ mod test {
                 ..config.params
             },
         };
-        assert!(store.save_config(new_config.clone()).is_ok());
+        assert!(store.save_config(&new_config).is_ok());
         let loaded = store.load_config();
         assert_eq!(loaded, new_config);
     }
@@ -215,9 +200,12 @@ mod test {
         let mut store = RewardsStore {
             storage: &mut mock_deps.storage,
         };
-        let epoch = Epoch::new(10, 1000);
+        let epoch = Epoch {
+            epoch_num: 10,
+            block_height_started: 1000,
+        };
         // save the first current epoch
-        let res = store.save_current_epoch(epoch.clone());
+        let res = store.save_current_epoch(&epoch);
         assert!(res.is_ok());
 
         let loaded = store.load_current_epoch();
@@ -225,9 +213,12 @@ mod test {
         assert_eq!(loaded.unwrap(), epoch);
 
         // now store a new epoch and load it
-        let new_epoch = Epoch::new(11, 2000);
+        let new_epoch = Epoch {
+            epoch_num: 11,
+            block_height_started: 2000,
+        };
 
-        let res = store.save_current_epoch(new_epoch.clone());
+        let res = store.save_current_epoch(&new_epoch);
         assert!(res.is_ok());
 
         let loaded = store.load_current_epoch();
@@ -243,16 +234,16 @@ mod test {
         };
 
         let event = Event {
+            contract: Addr::unchecked("some contract"),
             event_id: "some event".into(),
             epoch_num: 2,
         };
-        let contract = Addr::unchecked("some contract");
 
-        let res = store.save_event(event.event_id.clone(), contract.clone(), event.clone());
+        let res = store.save_event(&event);
         assert!(res.is_ok());
 
         // check that we load the event that we just saved
-        let loaded = store.load_event(event.event_id.clone(), contract.clone());
+        let loaded = store.load_event(event.event_id.clone(), event.contract.clone());
         assert!(loaded.is_ok());
         assert!(loaded.as_ref().unwrap().is_some());
         assert_eq!(loaded.unwrap().unwrap(), event);
@@ -274,7 +265,7 @@ mod test {
         assert!(loaded.unwrap().is_none());
 
         // different event id, but same contract address, should still return none
-        let loaded = store.load_event("some other event".into(), contract);
+        let loaded = store.load_event("some other event".into(), event.contract);
         assert!(loaded.is_ok());
         assert!(loaded.unwrap().is_none());
     }
@@ -290,7 +281,7 @@ mod test {
         let contract = Addr::unchecked("some contract");
         let tally = EpochTally::new(epoch_num, contract.clone());
 
-        let res = store.save_epoch_tally(contract.clone(), epoch_num, tally.clone());
+        let res = store.save_epoch_tally(&tally);
         assert!(res.is_ok());
 
         // check that we load the tally that we just saved
@@ -313,5 +304,28 @@ mod test {
         let loaded = store.load_epoch_tally(contract.clone(), epoch_num + 1);
         assert!(loaded.is_ok());
         assert!(loaded.unwrap().is_none());
+    }
+
+    #[test]
+    fn save_and_load_rewards_pool() {
+        let mut mock_deps = mock_dependencies();
+        let mut store = RewardsStore {
+            storage: &mut mock_deps.storage,
+        };
+
+        let contract = Addr::unchecked("some contract");
+        let pool = RewardsPool::new(contract.clone());
+        let res = store.save_rewards_pool(&pool);
+        assert!(res.is_ok());
+
+        let loaded = store.load_rewards_pool(contract);
+
+        assert!(loaded.is_ok());
+        assert!(loaded.as_ref().unwrap().is_some());
+        assert_eq!(loaded.unwrap().unwrap(), pool);
+
+        let loaded = store.load_rewards_pool(Addr::unchecked("a different contract"));
+        assert!(loaded.is_ok());
+        assert!(loaded.as_ref().unwrap().is_none());
     }
 }

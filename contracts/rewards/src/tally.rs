@@ -12,8 +12,6 @@ use crate::{
     state::{Config, CONFIG},
 };
 
-
-
 /*
 pub fn record_participation(
     event_id: String,
