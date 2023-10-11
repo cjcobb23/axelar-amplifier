@@ -1,75 +1,51 @@
 use std::{array::TryFromSliceError, collections::HashMap, hash::Hash, vec};
 
-use axelar_wasm_std::ContractError;
-use cosmwasm_std::{Addr, DepsMut, Env, Fraction, StdError, StdResult, Uint256, Uint64};
+use axelar_wasm_std::voting::Poll;
+use cosmwasm_std::{Addr, DepsMut, Env, Fraction, StdError, StdResult, Storage, Uint256, Uint64};
 use cw_storage_plus::{IntKey, Item, Key, KeyDeserialize, Map, PrimaryKey};
 
 use cosmwasm_schema::{cw_serde, QueryResponses};
 
-use crate::{msg::RewardsParams, state::CONFIG};
+use crate::{
+    error::ContractError,
+    msg::RewardsParams,
+    state::{Config, CONFIG},
+};
 
-#[cw_serde]
-struct EpochTally {
-    total_events: u64,
-    participation: HashMap<Addr, u64>,
-    epoch_num: u64,
-}
 
-#[cw_serde]
-struct Event {
-    event_id: String,
-    epoch: u64,
-}
 
-#[cw_serde]
-struct Epoch {
-    epoch_num: u64,
-    start: u64,
-}
-
-#[cw_serde]
-struct Pool {
-    cur_amount: Uint256,
-}
-
-const CURRENT_EPOCH: Item<Epoch> = Item::new("current_epoch");
-
-const TALLIES: Map<(Addr, u64), EpochTally> = Map::new("tallies");
-
-const EVENTS: Map<(String, Addr), Event> = Map::new("events");
-
-const POOLS: Map<Addr, Pool> = Map::new("pools");
-
+/*
 pub fn record_participation(
     event_id: String,
     worker: Addr,
     contract: Addr,
-    deps: DepsMut,
+    mut deps: DepsMut,
     env: Env,
 ) -> Result<(), ContractError> {
-    let cur_epoch = update_epoch(deps, env)?;
+    let cur_epoch = update_epoch(&mut deps, &env)?;
 
-    let event = EVENTS.may_load(deps.storage, (event_id, contract))?;
+    let event = EVENTS.may_load(deps.storage, (event_id.clone(), contract.clone()))?;
     let mut tally = match event {
         Some(event) => TALLIES
-            .may_load(deps.storage, (contract, event.epoch))?
+            .may_load(deps.storage, (contract.clone(), event.epoch_num))?
             .expect("couldn't find epoch tally for existing event"),
         None => {
             EVENTS.save(
                 deps.storage,
-                (event_id, contract),
+                (event_id.clone(), contract.clone()),
                 &Event {
                     event_id,
-                    epoch: cur_epoch.epoch_num,
+                    epoch_num: cur_epoch.epoch_num,
                 },
             )?;
             TALLIES
-                .may_load(deps.storage, (contract, cur_epoch.epoch_num))?
+                .may_load(deps.storage, (contract.clone(), cur_epoch.epoch_num))?
                 .map_or(
                     EpochTally {
                         total_events: 1,
                         participation: HashMap::new(),
                         epoch_num: cur_epoch.epoch_num,
+                        distributed_rewards: false,
                     },
                     |tally| EpochTally {
                         total_events: tally.total_events + 1,
@@ -78,47 +54,101 @@ pub fn record_participation(
                 )
         }
     };
-    
-    tally.participation.entry(worker).and_modify(|count| *count = *count+1).or_insert(1);
+
+    tally
+        .participation
+        .entry(worker)
+        .and_modify(|count| *count = *count + 1)
+        .or_insert(1);
     TALLIES.save(deps.storage, (contract, tally.epoch_num), &tally)?;
     Ok(())
 }
 
-pub fn get_pool_amount(contract: Addr) -> u32 {
-    todo!()
-}
-
-pub fn distribute_rewards(
+pub fn process_rewards(
     contract: Addr,
-    cur_epoch: Epoch,
-    deps: DepsMut,
+    mut deps: DepsMut,
     env: Env,
-) -> Result<Vec<Addr>, ContractError> {
-    let cur_epoch = update_epoch(deps, env)?;
+) -> Result<HashMap<Addr, Uint256>, ContractError> {
+    let cur_epoch = update_epoch(&mut deps, &env)?;
     let epoch = cur_epoch.epoch_num - 2;
-    let tally = TALLIES.load(deps.storage, (contract, epoch))?;
-
-    let config = CONFIG.load(deps.storage)?;
-    let cutoff = tally.total_events * config.params.participation_threshold.numerator()
-        / config.params.participation_threshold.denominator();
-    let mut to_reward = vec![];
-    for (worker, participated) in tally.participation {
-        if participated >= cutoff {
-            to_reward.push(worker);
+    let mut to_reward = HashMap::new();
+    loop {
+        let res = process_rewards_for_epoch(contract.clone(), epoch, &mut deps, &env);
+        match res {
+            Err(ContractError::AlreadyDistributedRewards) => {
+                break;
+            }
+            Err(_) => {
+                return res;
+            }
+            Ok(rewards) => {
+                to_reward.extend(rewards);
+            }
         }
     }
     Ok(to_reward)
 }
 
-fn update_epoch(deps: DepsMut, env: Env) -> Result<Epoch, ContractError> {
+pub fn process_rewards_for_epoch(
+    contract: Addr,
+    epoch: u64,
+    deps: &mut DepsMut,
+    env: &Env,
+) -> Result<HashMap<Addr, Uint256>, ContractError> {
+    let tally = TALLIES.load(deps.storage, (contract.clone(), epoch))?;
+    if tally.distributed_rewards {
+        return Err(ContractError::AlreadyDistributedRewards);
+    }
+
+    let config = CONFIG.load(deps.storage)?;
+    let cutoff = tally.total_events * u64::from(config.params.participation_threshold.numerator())
+        / u64::from(config.params.participation_threshold.denominator());
+    let mut to_reward = vec![];
+    for (worker, participated) in &tally.participation {
+        if *participated >= cutoff {
+            to_reward.push(worker.clone());
+        }
+    }
+
+    let pool = POOLS.load(deps.storage, contract.clone())?;
+    let rate: cosmwasm_std::Uint256 = config.params.rewards_rate.into();
+    if pool.cur_amount < rate {
+        return Err(ContractError::PoolBalanceInsufficient);
+    }
+    if rate < Uint256::from_u128(to_reward.len() as u128) {
+        return Err(ContractError::RateTooLow);
+    }
+    POOLS.save(
+        deps.storage,
+        contract.clone(),
+        &Pool {
+            cur_amount: pool.cur_amount - rate,
+        },
+    )?;
+    TALLIES.save(
+        deps.storage,
+        (contract, epoch),
+        &EpochTally {
+            distributed_rewards: true,
+            ..tally
+        },
+    )?;
+    let rewards_per_worker = rate.multiply_ratio(1u32, to_reward.len() as u32);
+    Ok(to_reward
+        .into_iter()
+        .map(|worker| (worker, rewards_per_worker))
+        .collect())
+}
+
+fn update_epoch(deps: &mut DepsMut, env: &Env) -> Result<Epoch, ContractError> {
     let epoch_duration: u64 = CONFIG.load(deps.storage)?.params.epoch_duration.into();
     let cur_height = env.block.height;
     let epoch = CURRENT_EPOCH.load(deps.storage)?;
-    if cur_height >= epoch.start + epoch_duration {
-        let new_epoch_num = ((cur_height - epoch.start) / epoch_duration) + epoch.epoch_num;
+    if cur_height >= epoch.block_height_started + epoch_duration {
+        let new_epoch_num = ((cur_height - epoch.block_height_started) / epoch_duration) + epoch.epoch_num;
         let new_epoch = Epoch {
             epoch_num: new_epoch_num,
-            start: cur_height,
+            block_height_started: cur_height,
         };
         CURRENT_EPOCH.save(deps.storage, &new_epoch)?;
         return Ok(new_epoch);
@@ -127,24 +157,41 @@ fn update_epoch(deps: DepsMut, env: Env) -> Result<Epoch, ContractError> {
 }
 
 pub fn update_params(
-    deps: DepsMut,
+    mut deps: DepsMut,
     env: Env,
     new_params: RewardsParams,
-) -> Result<Vec<Addr>, ContractError> {
-    let cur_epoch = update_epoch(deps, env)?;
-    todo!()
+) -> Result<(), ContractError> {
+    let _ = update_epoch(&mut deps, &env)?;
+    CONFIG.update(deps.storage, |config| -> Result<Config, ContractError> {
+        Ok(Config {
+            params: new_params,
+            ..config
+        })
+    })?;
+    Ok(())
 }
 
-/*
-pub fn end_blocker(deps: DepsMut, env: Env) -> Result<(), ContractError> {
-       let config = CONFIG.load(deps.storage)?;
-
-       let mut current_epoch = CURRENT_EPOCH.load(deps.storage)?;
-       if current_epoch.start + config.params.epoch_duration.into() <= env.block.height {
-            current_epoch.epoch_num += 1;
-            current_epoch.start = env.block.height;
-            CURRENT_EPOCH.save(deps.storage, &current_epoch);
-       }
-       Ok(())
+pub fn add_rewards(
+    contract: Addr,
+    amount: Uint256,
+    deps: &mut DepsMut,
+    env: &Env,
+) -> Result<(), ContractError> {
+    let _ = update_epoch(deps, env)?;
+    POOLS.update(
+        deps.storage,
+        contract,
+        |pool| -> Result<Pool, ContractError> {
+            match pool {
+                Some(pool) => Ok(Pool {
+                    cur_amount: pool.cur_amount + amount,
+                    ..pool
+                }),
+                None => Ok(Pool { cur_amount: amount }),
+            }
+        },
+    )?;
+    Ok(())
 }
+
 */
